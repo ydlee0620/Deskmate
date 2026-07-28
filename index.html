@@ -137,6 +137,12 @@
           <textarea id="persona">你是使用者桌上的AI小夥伴,個性溫暖、活潑、簡短風趣。用繁體中文口語化回答,盡量簡潔,不要長篇大論。</textarea>
         </div>
       </div>
+      <div class="row">
+        <div class="field">
+          <label>除錯紀錄（連線失敗時看這裡）</label>
+          <textarea id="debugLog" readonly style="height:120px; font-size:11px; font-family:monospace; color:#9fa3ab;"></textarea>
+        </div>
+      </div>
     </details>
 
     <button class="btn" id="toggleBtn">開始對話</button>
@@ -164,6 +170,8 @@
   // State: idle | listening | speaking
   let state = 'idle';
   let blink = 0;           // 0..1, 1 = fully closed
+  let blinkPhase = 'open'; // open | closing | closed | opening
+  let blinkPhaseAt = performance.now();
   let nextBlinkAt = performance.now() + 2000 + Math.random()*2500;
   let breathing = 0;
   let level = 0;           // smoothed audio energy for speaking pulse
@@ -190,15 +198,26 @@
     breathing += 0.02;
     const breathe = Math.sin(breathing) * 0.02;
 
-    // blink timing
-    if (t > nextBlinkAt && state !== 'speaking'){
-      blink = Math.min(1, blink + 0.35);
-      if (blink >= 1) nextBlinkAt = t + 60; // hold closed briefly then handled below
-    } else {
-      blink = Math.max(0, blink - 0.22);
-    }
-    if (blink <= 0.02 && t > nextBlinkAt + 200){
-      nextBlinkAt = t + 2200 + Math.random()*3200;
+    // blink timing (state machine: open -> closing -> closed -> opening -> open)
+    if (blinkPhase === 'open'){
+      blink = 0;
+      if (t > nextBlinkAt && state !== 'speaking'){
+        blinkPhase = 'closing'; blinkPhaseAt = t;
+      }
+    } else if (blinkPhase === 'closing'){
+      const p = Math.min(1, (t - blinkPhaseAt) / 90);
+      blink = p;
+      if (p >= 1){ blinkPhase = 'closed'; blinkPhaseAt = t; }
+    } else if (blinkPhase === 'closed'){
+      blink = 1;
+      if (t - blinkPhaseAt > 70){ blinkPhase = 'opening'; blinkPhaseAt = t; }
+    } else if (blinkPhase === 'opening'){
+      const p = Math.min(1, (t - blinkPhaseAt) / 130);
+      blink = 1 - p;
+      if (p >= 1){
+        blinkPhase = 'open'; blink = 0;
+        nextBlinkAt = t + 2400 + Math.random()*3200;
+      }
     }
 
     // gaze drift (idle only)
@@ -270,6 +289,17 @@
     statusEl.className = 'status' + (live ? ' live' : '');
   }
 
+  // ---------- On-screen debug log ----------
+  const debugLogEl = document.getElementById('debugLog');
+  const logLines = [];
+  function log(msg){
+    const time = new Date().toLocaleTimeString('zh-TW', { hour12:false });
+    logLines.push(`[${time}] ${msg}`);
+    if (logLines.length > 60) logLines.shift();
+    debugLogEl.value = logLines.join('\n');
+    debugLogEl.scrollTop = debugLogEl.scrollHeight;
+  }
+
   // ---------- Audio + Gemini Live plumbing ----------
   let ws = null;
   let micStream = null;
@@ -332,21 +362,28 @@
 
     setStatus('連線中…', false);
     toggleBtn.disabled = true;
+    const detailsEl = document.querySelector('details');
+    if (detailsEl) detailsEl.open = true;
 
+    log(`嘗試取得麥克風權限…`);
     try {
       micStream = await navigator.mediaDevices.getUserMedia({ audio: {
         channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true
       }});
+      log(`麥克風權限取得成功`);
     } catch (e){
+      log(`麥克風權限錯誤: ${e.name} - ${e.message}`);
       setStatus('麥克風權限被拒絕', false);
       toggleBtn.disabled = false;
       return;
     }
 
     const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+    log(`連線到 Gemini Live, model=${model}`);
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
+      log(`WebSocket 已開啟,送出 setup 訊息`);
       ws.send(JSON.stringify({
         setup: {
           model: `models/${model}`,
@@ -360,7 +397,11 @@
       let text = event.data;
       if (event.data instanceof Blob){ text = await event.data.text(); }
       let msg;
-      try { msg = JSON.parse(text); } catch(e){ return; }
+      try { msg = JSON.parse(text); } catch(e){ log(`收到無法解析的訊息: ${String(text).slice(0,120)}`); return; }
+
+      if (msg.error){
+        log(`伺服器回傳錯誤: ${JSON.stringify(msg.error).slice(0,300)}`);
+      }
 
       if (msg.setupComplete){
         running = true;
@@ -396,8 +437,9 @@
       }
     };
 
-    ws.onerror = () => { setStatus('連線發生錯誤', false); };
-    ws.onclose = () => {
+    ws.onerror = (e) => { log(`WebSocket 錯誤事件觸發`); setStatus('連線發生錯誤', false); };
+    ws.onclose = (e) => {
+      log(`WebSocket 關閉: code=${e.code} reason="${e.reason || '(無)'}" wasClean=${e.wasClean}`);
       running = false;
       setState('idle');
       setStatus('已結束', false);
